@@ -1,0 +1,44 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# secrets — env files
+.env
+.env.*
+!.env.example
+server/.env
+server/.env.*
+!server/.env.example
+
+# user-uploaded content / runtime data
+server/data/images/
+server/data/audio/
+server/data/recordings/
+server/data/backups/
+
+# ad-hoc scripts (may contain personal info)
+server/allow-me.mjs
+
+# Windows service runtime artifacts
+daemon/
+
+# rebuild bookkeeping
+.last-build-commit
+
+# logs
+*.log
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
