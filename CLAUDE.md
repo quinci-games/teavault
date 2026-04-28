@@ -175,7 +175,9 @@ DELETE /api/users/:id
 **Context model** — every chat call rebuilds the system prompt fresh:
 1. Persona + rules
 2. Current INVENTORY (only `quantity > 0` rows)
-3. RECENT SUGGESTIONS — first assistant message from up to 5 other recent threads, trimmed to 300 chars each. Lets him avoid repeating tea picks across conversations.
+3. RECENTLY SUGGESTED — structured **tea-name match list** extracted from the last 15 threads' assistant messages, deduplicated, with usage count + last-suggested date. Treated as a HARD AVOID list by the prompt rules. Override clause covers explicit user repeat requests + the "no acceptable alternative" case (when the avoid list saturates the inventory).
+
+**Avoid-list extraction** — `buildRecentSuggestionsText()` in [chatContext.ts](server/src/lib/chatContext.ts) walks every assistant message in the last 15 threads (excluding current), runs a word-boundary regex per inventory tea name against the full content, and tallies hits. Output looks like `- Earl Grey (3× recently, last Apr 26)`. Map insertion order = thread-recency order, so the model can prefer longest-ago picks if forced to repeat. NOTE: previous implementation (snippet-based, 300-char trimmed, first-message-only across 5 threads) caused near-deterministic repeats for daily-rotation usage — fixed by switching to structured extraction.
 
 **Pinning** — any assistant message has a star/pin button. Pinned messages appear in the *Pinned* tab in the sidebar, joined with their source thread for jump-back navigation.
 
@@ -320,6 +322,7 @@ All implemented and live. Recent additions in chronological order:
 - ✓ PWA installable (manifest, procedural leaf icons, theme color)
 - ✓ Two-tier Gemini key fallback (primary → fallback on quota errors with cooldown)
 - ✓ GitHub repo at https://github.com/quinci-games/teavault
+- ✓ Iori avoid-list hardening — structured tea-name extraction across 15 threads (replaces snippet trimming) + HARD AVOID rule in system prompt. Fixes near-deterministic repeats when used as a daily rotation tool.
 
 ## Possible future work (not committed to)
 

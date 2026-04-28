@@ -31,34 +31,90 @@ export async function buildInventoryText(): Promise<string> {
 }
 
 /**
- * Summarize recent assistant suggestions from OTHER threads so the model
- * can avoid repeating itself. Trims aggressively — we just want a hint,
- * not the full history. Only pulls threads older than the current one.
+ * Build a structured "recently suggested teas" list by matching every
+ * inventory tea name against every assistant message in the last 15
+ * threads (excluding the current one). The output is a dedup'd, count-
+ * and date-stamped checklist the model can treat as a hard avoid list.
+ *
+ * Rationale: the previous text-snippet approach trimmed responses at
+ * 300 chars and only looked at the first assistant message per thread —
+ * meaning multi-pick recommendations got decapitated and the model
+ * received fuzzy fragments instead of a concrete list. With a daily
+ * rotation use-case this caused near-deterministic repeats.
  */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function formatShortDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  } catch { return ''; }
+}
+
 export async function buildRecentSuggestionsText(excludeThreadId: number): Promise<string> {
+  // 1. Inventory tea names — including out-of-stock, since "you suggested
+  //    this recently" is independent of whether it's currently on the shelf.
+  const inventory = await db.select({ name: teas.name })
+    .from(teas)
+    .where(isNull(teas.deletedAt));
+  const teaNames = Array.from(new Set(
+    inventory.map(t => (t.name ?? '').trim()).filter(n => n.length > 0),
+  ));
+  if (teaNames.length === 0) return '(No teas in inventory yet.)';
+
+  // 2. Last 15 threads excluding the current one. Pulled in updated-desc
+  //    order so the first match per tea = most recent suggestion.
   const recentThreads = await db.select()
     .from(chatThreads)
-    .where(and(isNull(chatThreads.deletedAt)))
+    .where(isNull(chatThreads.deletedAt))
     .orderBy(desc(chatThreads.updatedAt))
-    .limit(8);
+    .limit(20);
+  const otherThreads = recentThreads.filter(t => t.id !== excludeThreadId).slice(0, 15);
+  if (otherThreads.length === 0) return '(No previous suggestions yet.)';
 
-  const summaries: string[] = [];
-  for (const t of recentThreads) {
-    if (t.id === excludeThreadId) continue;
-    const firstAssistantMsg = await db.select()
-      .from(chatMessages)
-      .where(and(eq(chatMessages.threadId, t.id), eq(chatMessages.role, 'assistant')))
-      .orderBy(chatMessages.createdAt)
-      .limit(1)
-      .get();
-    if (!firstAssistantMsg) continue;
-    // Trim to ~300 chars per thread so the context stays lean.
-    const snippet = firstAssistantMsg.content.slice(0, 300).replace(/\n+/g, ' ');
-    summaries.push(`- Thread "${t.title ?? 'Untitled'}" (${t.createdAt}): ${snippet}${firstAssistantMsg.content.length > 300 ? '…' : ''}`);
-    if (summaries.length >= 5) break;
+  // 3. Pre-compile word-boundary regexes once. \b avoids false positives
+  //    on substring fragments inside larger words.
+  const matchers = teaNames.map(name => ({
+    name,
+    re: new RegExp(`\\b${escapeRegex(name)}\\b`, 'i'),
+  }));
+
+  // 4. Walk every assistant message in every thread and tally hits.
+  type Hit = { count: number; lastDate: string };
+  const hits = new Map<string, Hit>();
+
+  for (const thread of otherThreads) {
+    const msgs = await db.select().from(chatMessages)
+      .where(and(eq(chatMessages.threadId, thread.id), eq(chatMessages.role, 'assistant')));
+    if (msgs.length === 0) continue;
+    const fullContent = msgs.map(m => m.content).join('\n');
+
+    for (const m of matchers) {
+      if (!m.re.test(fullContent)) continue;
+      const existing = hits.get(m.name);
+      if (!existing) {
+        // First match wins for lastDate because threads are descending.
+        hits.set(m.name, { count: 1, lastDate: thread.createdAt });
+      } else {
+        existing.count += 1;
+      }
+    }
   }
 
-  return summaries.length ? summaries.join('\n') : '(No previous suggestions yet.)';
+  if (hits.size === 0) return '(No previous suggestions yet.)';
+
+  // 5. Render as a clean checklist. Map iteration order = first-seen
+  //    order = most-recent-first, which is what we want.
+  const lines: string[] = [];
+  for (const [name, info] of hits.entries()) {
+    const dateStr = formatShortDate(info.lastDate);
+    const suffix = info.count > 1
+      ? ` (${info.count}× recently, last ${dateStr})`
+      : ` (last ${dateStr})`;
+    lines.push(`- ${name}${suffix}`);
+  }
+  return lines.join('\n');
 }
 
 export const SYSTEM_PROMPT = `You are IORI — a head butler at a Japanese butler café (think Swallowtail in Ikebukuro), known among the staff for his excellent English. You tend the TeaVault, the household's private tea collection, and advise on selections from it.
@@ -81,7 +137,7 @@ RULES:
 - When recommending a tea, quote its exact name (and brand if present) so the user can find it.
 - Consider caffeine carefully — herbal/rooibos for evening, higher-caffeine teas for morning, etc.
 - Respect any dietary/health context given (e.g. pre-diabetic diet = avoid teas with added sugar/honey in the notes, prefer unsweetened).
-- If asked to avoid repeats, check RECENT SUGGESTIONS and pick different teas unless the user overrides.
+- RECENTLY SUGGESTED is a HARD AVOID LIST by default. Do NOT recommend any tea on that list. Cycle through the rest of the inventory first — variety is part of your job. Override this rule only when (a) the user explicitly asks for a repeat or names a specific tea, or (b) every alternative in the inventory genuinely fails the request (e.g. user asks for caffeine-free evening picks and only herbal options remain on the avoid list). If you must repeat, briefly acknowledge it and prefer the tea suggested longest ago.
 - Keep responses concise and structured. Use markdown (headings, bullet lists) for readability.
 - If the cabinet is missing something useful for the request, say so plainly and suggest the household add it rather than inventing a tea.`;
 
@@ -91,6 +147,6 @@ export function buildFullPrompt(inventory: string, recent: string): string {
 INVENTORY (in-stock only):
 ${inventory}
 
-RECENT SUGGESTIONS FROM OTHER THREADS (avoid repeating unless user asks otherwise):
+RECENTLY SUGGESTED (hard avoid list — picks made in the last 15 conversations):
 ${recent}`;
 }
